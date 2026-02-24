@@ -112,11 +112,15 @@ impl<E> Error<E> {
         }
     }
 
-    /// Get inner error value
-    pub fn into_error(self) -> E {
-        self.error
+    /// Set response service
+    pub fn set_service(mut self, name: ByteString) -> Self {
+        self.service = Some(name);
+        self
     }
 
+    /// Map inner error to new error
+    ///
+    /// Keep same `service` and `location`
     pub fn map<U, F>(self, f: F) -> Error<U>
     where
         F: FnOnce(E) -> U,
@@ -127,13 +131,17 @@ impl<E> Error<E> {
             location: self.location,
         }
     }
+
+    /// Get inner error value
+    pub fn into_error(self) -> E {
+        self.error
+    }
 }
 
-impl<E: ErrorDiagnostic> From<E> for Error<E> {
+impl<E> From<E> for Error<E> {
     #[track_caller]
     fn from(error: E) -> Self {
-        let service = error.service();
-        Self::new(error, service, Location::caller())
+        Self::new(error, None, Location::caller())
     }
 }
 
