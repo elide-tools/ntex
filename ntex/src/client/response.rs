@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 #[cfg(feature = "cookie")]
 use coo_kie::{Cookie, ParseError as CookieParseError};
 
+use crate::error::Error;
 use crate::http::error::PayloadError;
 use crate::http::header::{AsName, CONTENT_LENGTH, HeaderValue};
 use crate::http::{HeaderMap, HttpMessage, Payload, ResponseHead, StatusCode, Version};
@@ -262,19 +263,19 @@ impl MessageBody {
 }
 
 impl Future for MessageBody {
-    type Output = Result<Bytes, PayloadError>;
+    type Output = Result<Bytes, Error<PayloadError>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         if let Some(err) = this.err.take() {
-            return Poll::Ready(Err(err));
+            return Poll::Ready(Err(err.into()));
         }
 
         if let Some(len) = this.length.take() {
             let limit = this.fut.as_ref().unwrap().limit;
             if limit > 0 && len > limit {
-                return Poll::Ready(Err(PayloadError::Overflow));
+                return Poll::Ready(Err(PayloadError::Overflow.into()));
             }
         }
 
@@ -368,25 +369,30 @@ impl<U> Future for JsonBody<U>
 where
     U: DeserializeOwned,
 {
-    type Output = Result<U, JsonPayloadError>;
+    type Output = Result<U, Error<JsonPayloadError>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(err) = self.err.take() {
-            return Poll::Ready(Err(err));
+            return Poll::Ready(Err(err.into()));
         }
 
         if let Some(len) = self.length.take() {
             let limit = self.fut.as_ref().unwrap().limit;
             if limit > 0 && len > limit {
-                return Poll::Ready(Err(JsonPayloadError::Payload(PayloadError::Overflow)));
+                return Poll::Ready(Err(
+                    JsonPayloadError::Payload(PayloadError::Overflow).into()
+                ));
             }
         }
 
         let body = match Pin::new(&mut self.get_mut().fut.as_mut().unwrap()).poll(cx) {
-            Poll::Ready(result) => result?,
+            Poll::Ready(result) => result.map_err(|e| e.map(JsonPayloadError::from))?,
             Poll::Pending => return Poll::Pending,
         };
-        Poll::Ready(serde_json::from_slice::<U>(&body).map_err(JsonPayloadError::from))
+        Poll::Ready(
+            serde_json::from_slice::<U>(&body)
+                .map_err(|e| JsonPayloadError::from(e).into()),
+        )
     }
 }
 
@@ -410,7 +416,7 @@ impl ReadBody {
 }
 
 impl Future for ReadBody {
-    type Output = Result<Bytes, PayloadError>;
+    type Output = Result<Bytes, Error<PayloadError>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -419,14 +425,14 @@ impl Future for ReadBody {
             return match Pin::new(&mut this.stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     if this.limit > 0 && (this.buf.len() + chunk.len()) > this.limit {
-                        Poll::Ready(Err(PayloadError::Overflow))
+                        Poll::Ready(Err(PayloadError::Overflow.into()))
                     } else {
                         this.buf.extend_from_slice(&chunk);
                         continue;
                     }
                 }
                 Poll::Ready(None) => Poll::Ready(Ok(this.buf.take())),
-                Poll::Ready(Some(Err(err))) => Poll::Ready(Err(err)),
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Err(err.into())),
                 Poll::Pending => {
                     if this.timeout.poll_elapsed(cx).is_ready() {
                         Poll::Ready(Err(PayloadError::Incomplete(Some(
@@ -434,7 +440,8 @@ impl Future for ReadBody {
                                 std::io::ErrorKind::TimedOut,
                                 "Operation timed out",
                             ),
-                        ))))
+                        ))
+                        .into()))
                     } else {
                         Poll::Pending
                     }
@@ -454,13 +461,13 @@ mod tests {
     #[crate::rt_test]
     async fn test_body() {
         let req = TestResponse::with_header(header::CONTENT_LENGTH, "xxxx").finish();
-        match req.body().await.err().unwrap() {
+        match req.body().await.err().unwrap().into_error() {
             PayloadError::UnknownLength => (),
             _ => unreachable!("error"),
         }
 
         let req = TestResponse::with_header(header::CONTENT_LENGTH, "1000000").finish();
-        match req.body().await.err().unwrap() {
+        match req.body().await.err().unwrap().into_error() {
             PayloadError::Overflow => (),
             _ => unreachable!("error"),
         }
@@ -473,7 +480,7 @@ mod tests {
         let req = TestResponse::default()
             .set_payload(Bytes::from_static(b"11111111111111"))
             .finish();
-        match req.body().limit(5).await.err().unwrap() {
+        match req.body().limit(5).await.err().unwrap().into_error() {
             PayloadError::Overflow => (),
             _ => unreachable!("error"),
         }
