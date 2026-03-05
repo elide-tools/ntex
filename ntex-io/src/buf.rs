@@ -1,24 +1,36 @@
-use std::{cell::Cell, fmt};
+use std::{cell::Cell, cell::RefCell, fmt};
 
-use ntex_bytes::BytesMut;
+use ntex_bytes::{Bytes, BytesMut};
 use ntex_util::future::Either;
 
 use crate::{IoRef, cfg::BufConfig};
 
-#[derive(Default)]
 pub(crate) struct Buffer {
     read: Cell<Option<BytesMut>>,
     write: Cell<Option<BytesMut>>,
+    write_chunks: RefCell<Vec<Bytes>>,
+}
+
+impl Default for Buffer {
+    fn default() -> Self {
+        Buffer {
+            read: Cell::new(None),
+            write: Cell::new(None),
+            write_chunks: RefCell::new(Vec::new()),
+        }
+    }
 }
 
 impl fmt::Debug for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b0 = self.read.take();
         let b1 = self.write.take();
+        let chunks_len = self.write_chunks.borrow().len();
         let res = f
             .debug_struct("Buffer")
             .field("read", &b0)
             .field("write", &b1)
+            .field("write_chunks", &chunks_len)
             .finish();
         self.read.set(b0);
         self.write.set(b1);
@@ -50,11 +62,13 @@ impl Stack {
                     let mut vec = vec![Buffer {
                         read: Cell::new(None),
                         write: Cell::new(None),
+                        write_chunks: RefCell::new(Vec::new()),
                     }];
                     for item in b.iter_mut().take(self.len) {
                         vec.push(Buffer {
                             read: Cell::new(item.read.take()),
                             write: Cell::new(item.write.take()),
+                            write_chunks: RefCell::new(item.write_chunks.borrow_mut().drain(..).collect()),
                         });
                     }
                     self.len += 1;
@@ -65,6 +79,7 @@ impl Stack {
                         let item = Buffer {
                             read: Cell::new(b[idx - 1].read.take()),
                             write: Cell::new(b[idx - 1].write.take()),
+                            write_chunks: RefCell::new(b[idx - 1].write_chunks.borrow_mut().drain(..).collect()),
                         };
                         b[idx] = item;
                         idx -= 1;
@@ -72,6 +87,7 @@ impl Stack {
                     b[0] = Buffer {
                         read: Cell::new(None),
                         write: Cell::new(None),
+                        write_chunks: RefCell::new(Vec::new()),
                     };
                     self.len += 1;
                 }
@@ -83,6 +99,7 @@ impl Stack {
                     Buffer {
                         read: Cell::new(None),
                         write: Cell::new(None),
+                        write_chunks: RefCell::new(Vec::new()),
                     },
                 );
             }
@@ -231,6 +248,23 @@ impl Stack {
         let size = wb.as_ref().map_or(0, BytesMut::len);
         item.write.set(wb);
         size
+    }
+
+    /// Drain accumulated scatter-gather body chunks from the last level.
+    pub(crate) fn get_write_chunks(&self) -> Vec<Bytes> {
+        self.get_last_level()
+            .write_chunks
+            .borrow_mut()
+            .drain(..)
+            .collect()
+    }
+
+    /// Push scatter-gather body chunks to the last level.
+    pub(crate) fn push_write_chunks(&self, chunks: Vec<Bytes>) {
+        self.get_last_level()
+            .write_chunks
+            .borrow_mut()
+            .extend(chunks);
     }
 }
 

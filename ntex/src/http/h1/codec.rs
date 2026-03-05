@@ -10,7 +10,7 @@ use crate::http::message::ConnectionType;
 use crate::http::request::Request;
 use crate::http::response::Response;
 use crate::http::{Method, Version};
-use crate::{Cfg, io::IoConfig, util::BytesMut};
+use crate::{Cfg, io::IoConfig, util::Bytes, util::BytesMut};
 
 use super::{Message, decoder, decoder::PayloadType, encoder};
 
@@ -183,6 +183,49 @@ impl Encoder for Codec {
             }
             Message::Chunk(Some(bytes)) => {
                 self.encoder.encode_chunk(bytes.as_ref(), dst, &self.cfg)?;
+            }
+            Message::Chunk(None) => {
+                self.encoder.encode_eof(dst)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_vectored(
+        &self,
+        item: Self::Item,
+        dst: &mut BytesMut,
+        body_chunks: &mut Vec<Bytes>,
+    ) -> Result<(), Self::Error> {
+        match item {
+            Message::Item((mut res, length)) => {
+                // set response version
+                res.head_mut().version = self.version.get();
+
+                // connection status
+                if let Some(ct) = res.head().ctype()
+                    && ct != ConnectionType::KeepAlive
+                {
+                    self.ctype.set(ct);
+                }
+
+                // encode message headers into dst (no body data here)
+                self.encoder.encode(
+                    dst,
+                    &res,
+                    self.flags.get().contains(Flags::HEAD),
+                    self.flags.get().contains(Flags::STREAM),
+                    self.version.get(),
+                    length,
+                    self.ctype.get(),
+                    None,
+                    &self.cfg,
+                )?;
+            }
+            Message::Chunk(Some(bytes)) => {
+                // scatter-gather: body data goes to body_chunks, framing to dst
+                self.encoder
+                    .encode_chunk_vectored(bytes, dst, body_chunks)?;
             }
             Message::Chunk(None) => {
                 self.encoder.encode_eof(dst)?;

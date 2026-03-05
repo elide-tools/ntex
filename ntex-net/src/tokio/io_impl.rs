@@ -105,6 +105,13 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     if let Some(mut buf) = ctx.get_write_buf() {
+        // TODO: true vectored write for tokio backend (currently copies body chunks)
+        let chunks = ctx.get_write_chunks();
+        if !chunks.is_empty() {
+            for chunk in chunks {
+                buf.extend_from_slice(&chunk);
+            }
+        }
         let result = write_io(io, &mut buf, cx);
         if ctx.release_write_buf(buf, result) == IoTaskStatus::Stop {
             Poll::Ready(Status::Terminate)
@@ -112,6 +119,18 @@ where
             Poll::Pending
         }
     } else {
+        // Even without a write buf, there might be body chunks to flush
+        let chunks = ctx.get_write_chunks();
+        if !chunks.is_empty() {
+            let mut buf = ntex_bytes::BytesMut::new();
+            for chunk in chunks {
+                buf.extend_from_slice(&chunk);
+            }
+            let result = write_io(io, &mut buf, cx);
+            if ctx.release_write_buf(buf, result) == IoTaskStatus::Stop {
+                return Poll::Ready(Status::Terminate);
+            }
+        }
         Poll::Pending
     }
 }

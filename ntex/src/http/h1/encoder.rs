@@ -13,7 +13,7 @@ use crate::http::error::EncodeError;
 use crate::http::header::{CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING, Value};
 use crate::http::message::{ConnectionType, RequestHead};
 use crate::http::{HeaderMap, Response, StatusCode, Version, helpers};
-use crate::{io::IoConfig, util::BufMut, util::BytesMut};
+use crate::{io::IoConfig, util::BufMut, util::Bytes, util::BytesMut};
 
 #[derive(Debug)]
 pub(crate) struct MessageEncoder<T: MessageType> {
@@ -276,6 +276,19 @@ impl<T: MessageType> MessageEncoder<T> {
         result
     }
 
+    /// Encode body chunk with scatter-gather support (zero-copy for body data).
+    pub(crate) fn encode_chunk_vectored(
+        &self,
+        bytes: Bytes,
+        buf: &mut BytesMut,
+        body_chunks: &mut Vec<Bytes>,
+    ) -> Result<bool, EncodeError> {
+        let mut te = self.te.get();
+        let result = te.encode_vectored(bytes, buf, body_chunks);
+        self.te.set(te);
+        result
+    }
+
     pub(crate) fn encode(
         &self,
         dst: &mut BytesMut,
@@ -409,6 +422,54 @@ impl TransferEncoding {
                 } else {
                     Ok(true)
                 }
+            }
+        }
+    }
+
+    /// Encode body data with scatter-gather support. Body data is pushed to
+    /// `body_chunks` instead of being copied into `buf`, avoiding memcpy.
+    #[inline]
+    pub(crate) fn encode_vectored(
+        &mut self,
+        bytes: Bytes,
+        buf: &mut BytesMut,
+        body_chunks: &mut Vec<Bytes>,
+    ) -> Result<bool, EncodeError> {
+        if bytes.is_empty() {
+            return self.encode_eof(buf).map(|()| true);
+        }
+        match self.kind {
+            TransferEncodingKind::Eof => {
+                body_chunks.push(bytes);
+                Ok(false)
+            }
+            TransferEncodingKind::Chunked(eof) => {
+                if eof {
+                    return Ok(true);
+                }
+                // chunk header: "<hex-size>\r\n"
+                writeln!(helpers::Writer(buf), "{:X}\r", bytes.len())
+                    .map_err(EncodeError::Fmt)?;
+                // body data (zero-copy)
+                body_chunks.push(bytes);
+                // chunk trailer
+                body_chunks.push(Bytes::from_static(b"\r\n"));
+                Ok(false)
+            }
+            TransferEncodingKind::Length(mut remaining) => {
+                if remaining == 0 {
+                    return Ok(true);
+                }
+                let len = cmp::min(remaining, bytes.len() as u64);
+                let chunk = if len == bytes.len() as u64 {
+                    bytes
+                } else {
+                    bytes.slice(..len as usize)
+                };
+                body_chunks.push(chunk);
+                remaining -= len;
+                self.kind = TransferEncodingKind::Length(remaining);
+                Ok(remaining == 0)
             }
         }
     }

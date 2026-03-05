@@ -189,6 +189,36 @@ impl Bytes {
         self.storage.is_inline()
     }
 
+    /// Creates a new `Bytes` from an externally-owned buffer.
+    ///
+    /// The owner must implement `AsRef<[u8]>` to provide the byte data. The
+    /// returned `Bytes` will point directly into the owner's memory with no
+    /// copying. When all clones of the `Bytes` are dropped, the owner `T`
+    /// is dropped, freeing whatever resources it holds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::Bytes;
+    ///
+    /// let owned: Box<[u8]> = Box::from(b"hello world" as &[u8]);
+    /// let b = Bytes::from_owner(owned);
+    /// assert_eq!(&b[..], b"hello world");
+    /// ```
+    #[must_use]
+    pub fn from_owner<T: AsRef<[u8]> + Send + Sync + 'static>(owner: T) -> Bytes {
+        // If the data is small enough, inline it instead of heap-allocating
+        // the owned header.
+        if owner.as_ref().len() <= INLINE_CAP {
+            return Bytes {
+                storage: Storage::from_slice(owner.as_ref()),
+            };
+        }
+        Bytes {
+            storage: Storage::from_owner(owner),
+        }
+    }
+
     /// Creates `Bytes` instance from slice, by copying it.
     ///
     /// Data from the slice could be inlined.

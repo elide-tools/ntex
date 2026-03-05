@@ -19,7 +19,9 @@ fn is_send<T: Send>() {}
 #[test]
 fn test_size() {
     assert_eq!(24, std::mem::size_of::<Bytes>());
-    assert_eq!(24, std::mem::size_of::<Option<Bytes>>());
+    // Option<Bytes> is 32 bytes because Storage::offset is now a plain usize
+    // (no niche optimization) to support KIND_OWNED = 0b00.
+    assert_eq!(32, std::mem::size_of::<Option<Bytes>>());
     assert_eq!(20, ntex_bytes::METADATA_SIZE);
 
     let mut t = BytesMut::new();

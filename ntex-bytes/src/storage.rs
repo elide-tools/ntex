@@ -97,14 +97,14 @@ use crate::alloc::alloc::{self, Layout, LayoutError};
 
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{self, AtomicU32};
-use std::{cmp, mem, num::NonZeroUsize, ptr, ptr::NonNull, slice};
+use std::{cmp, mem, ptr, ptr::NonNull, slice};
 
 use crate::{info::Info, info::Kind};
 
 #[cfg(target_endian = "little")]
 #[repr(C)]
 pub(crate) struct Storage {
-    offset: NonZeroUsize,
+    offset: usize,
     ptr: *mut u8,
     len: usize,
 }
@@ -114,7 +114,7 @@ pub(crate) struct Storage {
 pub(crate) struct Storage {
     len: usize,
     ptr: *mut u8,
-    offset: NonZeroUsize,
+    offset: usize,
 }
 
 #[derive(Debug)]
@@ -130,6 +130,7 @@ struct SharedVec {
 pub(crate) struct StorageVec(NonNull<SharedVec>);
 
 // Buffer storage strategy flags.
+const KIND_OWNED: usize = 0b00;
 const KIND_VEC: usize = 0b01;
 const KIND_INLINE: usize = 0b10;
 const KIND_STATIC: usize = 0b11;
@@ -162,12 +163,34 @@ pub(crate) const INLINE_CAP: usize = 3 * 8 - 1;
 pub(crate) const INLINE_CAP: usize = 3 * 4 - 1;
 
 // Inline storage
-const PTR_INLINE: NonZeroUsize = NonZeroUsize::new(KIND_INLINE).unwrap();
+const PTR_INLINE: usize = KIND_INLINE;
 // Static storage
-const PTR_STATIC: NonZeroUsize = NonZeroUsize::new(KIND_STATIC).unwrap();
+const PTR_STATIC: usize = KIND_STATIC;
 // Default offset
-const DEFAUILT_OFFSET: NonZeroUsize =
-    NonZeroUsize::new((METADATA_SIZE << KIND_OFFSET_BITS) ^ KIND_VEC).unwrap();
+const DEFAUILT_OFFSET: usize = (METADATA_SIZE << KIND_OFFSET_BITS) ^ KIND_VEC;
+
+/// Header for externally-owned buffer storage.
+///
+/// When `Bytes::from_owner()` is used, we allocate an `OwnedHeaderImpl<T>` on
+/// the heap. The `offset` field in `Storage` points directly to this
+/// allocation (with tag bits 0b00 = KIND_OWNED). When the last clone is
+/// dropped, `drop_fn` is called with the pointer to reconstruct and drop
+/// the `Box<OwnedHeaderImpl<T>>`.
+#[repr(C)]
+struct OwnedHeader {
+    ref_count: AtomicU32,
+    drop_fn: unsafe fn(*mut u8),
+}
+
+#[repr(C)]
+struct OwnedHeaderImpl<T> {
+    header: OwnedHeader,
+    owner: T,
+}
+
+unsafe fn drop_owned_header_impl<T>(ptr: *mut u8) {
+    let _ = Box::from_raw(ptr.cast::<OwnedHeaderImpl<T>>());
+}
 
 /*
  *
@@ -214,6 +237,36 @@ impl Storage {
                 ptr: shared.as_ptr().add(1).cast::<u8>(),
                 offset: DEFAUILT_OFFSET,
             }
+        }
+    }
+
+    /// Create storage from an externally-owned buffer.
+    ///
+    /// The owner `T` must implement `AsRef<[u8]>` to provide the data pointer
+    /// and length. When all clones are dropped, the owner is dropped, freeing
+    /// whatever resources it holds.
+    pub(crate) fn from_owner<T: AsRef<[u8]> + Send + Sync + 'static>(owner: T) -> Storage {
+        let data_ptr = owner.as_ref().as_ptr() as *mut u8;
+        let data_len = owner.as_ref().len();
+
+        let boxed = Box::new(OwnedHeaderImpl {
+            header: OwnedHeader {
+                ref_count: AtomicU32::new(1),
+                drop_fn: drop_owned_header_impl::<T>,
+            },
+            owner,
+        });
+        let header_ptr = Box::into_raw(boxed) as usize;
+
+        // header_ptr has tag 0b00 = KIND_OWNED since heap allocations are
+        // at least 8-byte aligned.
+        debug_assert!(header_ptr & KIND_MASK == KIND_OWNED);
+        debug_assert!(header_ptr != 0); // heap pointer is never null
+
+        Storage {
+            offset: header_ptr,
+            ptr: data_ptr,
+            len: data_len,
         }
     }
 
@@ -280,7 +333,7 @@ impl Storage {
 
     #[inline]
     fn inline_len(&self) -> usize {
-        (self.offset.get() & INLINE_LEN_MASK) >> KIND_OFFSET_BITS
+        (self.offset & INLINE_LEN_MASK) >> KIND_OFFSET_BITS
     }
 
     #[inline]
@@ -294,7 +347,7 @@ impl Storage {
         match kind {
             KIND_VEC => unsafe { (*self.shared_vec()).capacity() },
             KIND_INLINE => INLINE_CAP,
-            _ => self.len,
+            _ => self.len, // KIND_STATIC and KIND_OWNED
         }
     }
 
@@ -351,9 +404,9 @@ impl Storage {
     pub(crate) fn trimdown(&mut self) {
         let kind = self.kind();
 
-        // trim down only if buffer is not inline or static and
+        // trim down only if buffer is not inline, static, or owned and
         // buffer's unused space is greater than 64 bytes
-        if !(kind == KIND_INLINE || kind == KIND_STATIC) {
+        if !(kind == KIND_INLINE || kind == KIND_STATIC || kind == KIND_OWNED) {
             if self.len() <= INLINE_CAP {
                 *self = unsafe { Storage::from_ptr_inline(self.as_ptr(), self.len()) };
             } else if self.capacity() - self.len() >= 64 {
@@ -372,6 +425,7 @@ impl Storage {
             }
             KIND_INLINE => self.set_inline_len(len),
             _ => {
+                // KIND_STATIC and KIND_OWNED
                 assert!(len <= self.len);
                 self.len = len;
             }
@@ -383,11 +437,7 @@ impl Storage {
     #[inline]
     fn set_inline_len(&mut self, len: usize) {
         debug_assert!(len <= INLINE_CAP);
-        self.offset = unsafe {
-            NonZeroUsize::new_unchecked(
-                self.offset.get() & !INLINE_LEN_MASK | (len << KIND_OFFSET_BITS),
-            )
-        };
+        self.offset = self.offset & !INLINE_LEN_MASK | (len << KIND_OFFSET_BITS);
     }
 
     pub(crate) unsafe fn set_start(&mut self, start: usize) {
@@ -404,7 +454,7 @@ impl Storage {
                 // Updating the start of the view is setting `ptr` to point to the
                 // new start and updating the `len` field to reflect the new length
                 // of the view.
-                let offset = (self.offset.get() >> KIND_OFFSET_BITS) + start;
+                let offset = (self.offset >> KIND_OFFSET_BITS) + start;
 
                 self.ptr = (shared.cast::<u8>()).add(offset);
                 if self.len >= start {
@@ -413,8 +463,7 @@ impl Storage {
                     self.len = 0;
                 }
 
-                self.offset =
-                    NonZeroUsize::new_unchecked((offset << KIND_OFFSET_BITS) ^ KIND_VEC);
+                self.offset = (offset << KIND_OFFSET_BITS) ^ KIND_VEC;
             }
             KIND_INLINE => {
                 assert!(start <= INLINE_CAP);
@@ -437,6 +486,12 @@ impl Storage {
                     self.set_inline_len(new_len);
                 }
             }
+            KIND_OWNED => {
+                // For owned storage, just adjust ptr and len
+                assert!(start <= self.len);
+                self.len -= start;
+                self.ptr = self.ptr.add(start);
+            }
             _ => {
                 // set len for static storage
                 assert!(start <= self.len);
@@ -457,7 +512,7 @@ impl Storage {
                 self.set_inline_len(new_len);
             }
             _ => {
-                // set len for static storage
+                // set len for static and owned storage
                 assert!(end <= self.len);
                 self.len = end;
             }
@@ -495,6 +550,14 @@ impl Storage {
             let mut inner: mem::MaybeUninit<Storage> = mem::MaybeUninit::uninit();
             ptr::copy_nonoverlapping(self, inner.as_mut_ptr(), 1);
             inner.assume_init()
+        } else if kind == KIND_OWNED {
+            // Increment the ref count on the owned header
+            let header = self.offset as *mut OwnedHeader;
+            let ref_cnt = (*header).ref_count.fetch_add(1, Relaxed);
+            if ref_cnt == u32::MAX {
+                abort();
+            }
+            Storage { ..*self }
         } else {
             // ptr points to SharedVec
             let shared = self.shared_vec();
@@ -515,7 +578,7 @@ impl Storage {
 
     #[inline]
     fn shared_vec(&self) -> *mut SharedVec {
-        let offset = self.offset.get() >> KIND_OFFSET_BITS;
+        let offset = self.offset >> KIND_OFFSET_BITS;
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             self.ptr.sub(offset).cast::<SharedVec>()
@@ -557,7 +620,7 @@ impl Storage {
             }
         }
 
-        imp(self.offset.get())
+        imp(self.offset)
     }
 
     pub(crate) fn info(&self) -> Info {
@@ -572,6 +635,13 @@ impl Storage {
                     (*ptr).offset as usize
                         + (*ptr).len as usize
                         + (*ptr).remaining as usize,
+                )
+            } else if kind == KIND_OWNED {
+                let header = self.offset as *const OwnedHeader;
+                (
+                    self.offset,
+                    (*header).ref_count.load(Relaxed),
+                    self.len,
                 )
             } else {
                 (0, 0, 0)
@@ -598,8 +668,11 @@ impl Clone for Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        if self.kind() == KIND_VEC {
+        let kind = self.kind();
+        if kind == KIND_VEC {
             release_shared_vec(self.shared_vec());
+        } else if kind == KIND_OWNED {
+            release_owned(self.offset as *mut OwnedHeader);
         }
     }
 }
@@ -676,9 +749,7 @@ impl StorageVec {
                 let inner = Storage {
                     ptr: (self.0.as_ptr().cast::<u8>()).add(offset),
                     len: self.len(),
-                    offset: NonZeroUsize::new_unchecked(
-                        (offset << KIND_OFFSET_BITS) ^ KIND_VEC,
-                    ),
+                    offset: (offset << KIND_OFFSET_BITS) ^ KIND_VEC,
                 };
                 mem::forget(self);
                 inner
@@ -703,9 +774,7 @@ impl StorageVec {
                 Storage {
                     ptr: (self.0.as_ptr().cast::<u8>()).add(offset),
                     len: at,
-                    offset: NonZeroUsize::new_unchecked(
-                        (offset << KIND_OFFSET_BITS) ^ KIND_VEC,
-                    ),
+                    offset: (offset << KIND_OFFSET_BITS) ^ KIND_VEC,
                 }
             };
             self.set_start(at as u32);
@@ -898,6 +967,22 @@ impl SharedVec {
     }
 }
 
+fn release_owned(ptr: *mut OwnedHeader) {
+    unsafe {
+        if (*ptr).ref_count.fetch_sub(1, Release) != 1 {
+            return;
+        }
+
+        // Same Acquire fence as release_shared_vec — ensures all accesses
+        // to the data happen-before we drop the owner.
+        atomic::fence(Acquire);
+
+        // Call the type-erased drop function which reconstructs and drops
+        // the Box<OwnedHeaderImpl<T>>.
+        ((*ptr).drop_fn)(ptr.cast::<u8>());
+    }
+}
+
 fn release_shared_vec(ptr: *mut SharedVec) {
     // `Shared` storage... follow the drop steps from Arc.
     unsafe {
@@ -957,6 +1042,7 @@ impl Drop for Abort {
 impl Kind {
     fn from_raw(n: usize) -> Kind {
         match n {
+            KIND_OWNED => Kind::Owned,
             KIND_INLINE => Kind::Inline,
             KIND_STATIC => Kind::Static,
             _ => Kind::Vec,
@@ -979,6 +1065,117 @@ mod tests {
         b"mary had a little lamb, little lamb, little lamb, little lamb, little lamb, little lamb \
         mary had a little lamb, little lamb, little lamb, little lamb, little lamb, little lamb \
         mary had a little lamb, little lamb, little lamb, little lamb, little lamb, little lamb";
+
+    #[test]
+    fn from_owner_basic() {
+        // Test basic owned storage
+        let data: Box<[u8]> = Box::from(LONG);
+        let b = Bytes::from_owner(data);
+        assert_eq!(&b[..], LONG);
+        assert!(!b.is_inline());
+        assert_eq!(b.info().kind, crate::info::Kind::Owned);
+        assert_eq!(b.info().refs, 1);
+    }
+
+    #[test]
+    fn from_owner_clone_and_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        struct DropTracker {
+            data: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for DropTracker {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let tracker = DropTracker {
+            data: LONG.to_vec(),
+            dropped: dropped.clone(),
+        };
+
+        let b1 = Bytes::from_owner(tracker);
+        assert_eq!(&b1[..], LONG);
+        assert_eq!(b1.info().refs, 1);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        // Clone should increment ref count
+        let b2 = b1.clone();
+        assert_eq!(&b2[..], LONG);
+        assert_eq!(b1.info().refs, 2);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        // Drop first clone
+        drop(b1);
+        assert_eq!(b2.info().refs, 1);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        // Drop last clone — should drop the owner
+        drop(b2);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn from_owner_slice_operations() {
+        let data: Box<[u8]> = Box::from(LONG);
+        let mut b = Bytes::from_owner(data);
+        // split_to
+        let front = b.split_to(10);
+        assert_eq!(&front[..], &LONG[..10]);
+        assert_eq!(&b[..], &LONG[10..]);
+
+        // split_off
+        let mut b2 = Bytes::from_owner(Box::from(LONG) as Box<[u8]>);
+        let back = b2.split_off(10);
+        assert_eq!(&b2[..], &LONG[..10]);
+        assert_eq!(&back[..], &LONG[10..]);
+
+        // truncate
+        let mut b3 = Bytes::from_owner(Box::from(LONG) as Box<[u8]>);
+        b3.truncate(50);
+        assert_eq!(&b3[..], &LONG[..50]);
+
+        // advance_to
+        let mut b4 = Bytes::from_owner(Box::from(LONG) as Box<[u8]>);
+        b4.advance_to(5);
+        assert_eq!(&b4[..], &LONG[5..]);
+
+        // slice
+        let b5 = Bytes::from_owner(Box::from(LONG) as Box<[u8]>);
+        let sliced = b5.slice(10..50);
+        assert_eq!(&sliced[..], &LONG[10..50]);
+    }
+
+    #[test]
+    fn from_owner_small_inlines() {
+        // Small data should be inlined
+        let data: Box<[u8]> = Box::from(&b"hello"[..]);
+        let b = Bytes::from_owner(data);
+        assert!(b.is_inline());
+        assert_eq!(&b[..], b"hello");
+    }
+
+    #[test]
+    fn from_owner_trimdown_noop() {
+        let data: Box<[u8]> = Box::from(LONG);
+        let mut b = Bytes::from_owner(data);
+        let ptr_before = b.as_ref().as_ptr();
+        b.trimdown();
+        // trimdown is a no-op for owned storage
+        let ptr_after = b.as_ref().as_ptr();
+        assert_eq!(ptr_before, ptr_after);
+        assert_eq!(&b[..], LONG);
+    }
 
     #[test]
     fn trimdown() {

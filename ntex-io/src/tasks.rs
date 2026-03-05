@@ -1,6 +1,6 @@
 use std::{cell::Cell, fmt, io, ptr, task::Context, task::Poll};
 
-use ntex_bytes::BytesMut;
+use ntex_bytes::{Bytes, BytesMut};
 use ntex_util::time::{Sleep, sleep};
 
 use crate::{FilterCtx, Flags, IoRef, IoTaskStatus, Readiness};
@@ -224,6 +224,11 @@ impl IoContext {
             .buffer
             .get_write_destination()
             .and_then(|buf| if buf.is_empty() { None } else { Some(buf) })
+    }
+
+    /// Get accumulated scatter-gather body chunks.
+    pub fn get_write_chunks(&self) -> Vec<Bytes> {
+        self.0.0.buffer.get_write_chunks()
     }
 
     /// Set write buffer

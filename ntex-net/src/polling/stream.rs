@@ -393,7 +393,14 @@ impl StreamItem {
     }
 
     fn write(&mut self) -> IoTaskStatus {
-        if let Some(buf) = self.ctx.get_write_buf() {
+        if let Some(mut buf) = self.ctx.get_write_buf() {
+            // TODO: true vectored write for polling backend (currently copies body chunks)
+            let chunks = self.ctx.get_write_chunks();
+            if !chunks.is_empty() {
+                for chunk in chunks {
+                    buf.extend_from_slice(&chunk);
+                }
+            }
             let fd = self.fd();
             log::trace!("{}: {fd:?}-Wrt buf({:?})", self.ctx.tag(), buf.len());
             let res = syscall!(break libc::write(fd, buf[..].as_ptr().cast(), buf.len()));

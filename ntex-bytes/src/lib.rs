@@ -96,5 +96,6 @@ pub mod info {
         Inline,
         Static,
         Vec,
+        Owned,
     }
 }

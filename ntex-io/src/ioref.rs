@@ -125,13 +125,24 @@ impl IoRef {
             log::trace!("{}: Io is closed/closing, skip frame encoding", self.tag());
             Ok(())
         } else {
-            self.with_write_buf(|buf| {
+            let mut body_chunks = Vec::new();
+            let result = self.with_write_buf(|buf| {
                 // make sure we've got room
                 self.cfg().write_buf().resize(buf);
 
-                // encode item and wake write task
-                codec.encode(item, buf)
-            })
+                // encode item with scatter-gather support
+                codec.encode_vectored(item, buf, &mut body_chunks)
+            });
+            if !body_chunks.is_empty() {
+                self.0.buffer.push_write_chunks(body_chunks);
+                // Wake write task — body chunks need to be flushed even if
+                // the write BytesMut is empty (scatter-gather path).
+                if self.0.flags.get().contains(Flags::WR_PAUSED) {
+                    self.0.remove_flags(Flags::WR_PAUSED);
+                    self.0.write_task.wake();
+                }
+            }
+            result
             // .with_write_buf() could return io::Error<Result<(), U::Error>>,
             // in that case mark io as failed
             .unwrap_or_else(|err| {

@@ -2,7 +2,7 @@ use std::{any, future::poll_fn, io, mem, task::Poll};
 
 use compio_buf::{BufResult, IoBuf, IoBufMut, SetLen};
 use compio_io::{AsyncRead, AsyncWrite};
-use ntex_bytes::{BufMut, BytesMut};
+use ntex_bytes::{BufMut, Bytes, BytesMut};
 use ntex_io::{Handle, IoContext, IoStream, IoTaskStatus, Readiness, types};
 use ntex_util::future::{Either, select};
 
@@ -38,6 +38,16 @@ impl Handle for HandleWrapper {
 struct CompioBuf(BytesMut);
 
 impl IoBuf for CompioBuf {
+    #[inline]
+    fn as_init(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Zero-copy wrapper for writing `Bytes` directly via compio.
+struct CompioBytes(Bytes);
+
+impl IoBuf for CompioBytes {
     #[inline]
     fn as_init(&self) -> &[u8] {
         &self.0
@@ -154,9 +164,15 @@ where
                     let _ = io.shutdown().await;
                     break;
                 }
+                // flush scatter-gather body chunks (zero-copy path)
+                if write_chunks(&mut io, ctx).await == IoTaskStatus::Stop {
+                    let _ = io.shutdown().await;
+                    break;
+                }
             }
             Readiness::Shutdown => {
                 write_buf(&mut io, ctx, ctx.get_write_buf()).await;
+                write_chunks(&mut io, ctx).await;
                 let _ = io.shutdown().await;
                 break;
             }
@@ -199,4 +215,37 @@ where
     } else {
         IoTaskStatus::Io
     }
+}
+
+/// Write scatter-gather body chunks directly to the socket without copying.
+async fn write_chunks<T>(io: &mut T, ctx: &IoContext) -> IoTaskStatus
+where
+    T: AsyncRead + AsyncWrite,
+{
+    let chunks = ctx.get_write_chunks();
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut buf = CompioBytes(chunk);
+        loop {
+            let BufResult(result, buf1) = io.write(buf).await;
+            buf = buf1;
+            match result {
+                Ok(0) => {
+                    return IoTaskStatus::Stop;
+                }
+                Ok(size) => {
+                    if size >= buf.0.len() {
+                        break;
+                    }
+                    buf.0 = buf.0.slice(size..);
+                }
+                Err(_) => {
+                    return IoTaskStatus::Stop;
+                }
+            }
+        }
+    }
+    IoTaskStatus::Io
 }

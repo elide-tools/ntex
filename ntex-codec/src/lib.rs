@@ -14,6 +14,19 @@ pub trait Encoder {
 
     /// Encodes a frame into the buffer provided.
     fn encode(&self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error>;
+
+    /// Encode with scatter-gather support. Body data that should be written
+    /// without copying into `dst` can be pushed to `body_chunks`.
+    /// The default delegates to `encode()`, ignoring `body_chunks`.
+    fn encode_vectored(
+        &self,
+        item: Self::Item,
+        dst: &mut BytesMut,
+        body_chunks: &mut Vec<Bytes>,
+    ) -> Result<(), Self::Error> {
+        let _ = body_chunks;
+        self.encode(item, dst)
+    }
 }
 
 /// Decoding of frames via buffers.
@@ -41,6 +54,15 @@ where
 
     fn encode(&self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
         (**self).encode(item, dst)
+    }
+
+    fn encode_vectored(
+        &self,
+        item: Self::Item,
+        dst: &mut BytesMut,
+        body_chunks: &mut Vec<Bytes>,
+    ) -> Result<(), Self::Error> {
+        (**self).encode_vectored(item, dst, body_chunks)
     }
 }
 
