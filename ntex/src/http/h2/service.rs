@@ -455,11 +455,22 @@ where
             Uri::try_from(path.as_str())?
         };
         let is_head_req = method == Method::HEAD;
+        let is_connect = method == Method::CONNECT;
         head.version = Version::HTTP_2;
         head.method = method;
         head.headers = headers;
         head.io = CurrentIo::Ref(io);
         head.id = self.id;
+
+        // RFC 8441: Extended CONNECT — synthesize Upgrade header from :protocol
+        // so service handlers can detect WebSocket upgrades uniformly.
+        if is_connect {
+            if let Some(protocol) = pseudo.protocol {
+                if let Ok(val) = HeaderValue::from_str(protocol.as_str()) {
+                    head.headers.insert(header::UPGRADE, val);
+                }
+            }
+        }
 
         let (mut res, mut body) = match cfg.service.call(req).await {
             Ok(res) => res.into().into_parts(),
