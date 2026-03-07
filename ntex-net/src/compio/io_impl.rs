@@ -239,7 +239,7 @@ where
                     if size >= buf.0.len() {
                         break;
                     }
-                    buf.0 = buf.0.slice(size..);
+                    buf.0 = Bytes::slice(&buf.0, size..);
                 }
                 Err(_) => {
                     return IoTaskStatus::Stop;
