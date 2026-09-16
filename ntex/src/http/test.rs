@@ -344,13 +344,14 @@ impl TestServer {
                 ntex_h2::ServiceConfig::new()
                     .set_max_header_list_size(256 * 1024)
                     .set_max_header_continuation_frames(96),
-            )
-            .add(
-                WsClientConfig::new()
-                    .set_address(addr)
-                    .set_timeout(Seconds(30)),
-            )
-            .build();
+            );
+        #[cfg(feature = "ws")]
+        let cfg = cfg.add(
+            WsClientConfig::new()
+                .set_address(addr)
+                .set_timeout(Seconds(30)),
+        );
+        let cfg = cfg.build();
 
         let client = Self::create_client(cfg.clone());
 
@@ -367,20 +368,21 @@ impl TestServer {
     #[must_use]
     /// Set client timeout
     pub fn set_client_timeout(mut self, timeout: Seconds, connect_timeout: Millis) -> Self {
-        self.cfg = SharedCfg::new("TEST-CLIENT")
+        let cfg = SharedCfg::new("TEST-CLIENT")
             .add(IoConfig::new().set_connect_timeout(connect_timeout))
             .add(TlsConfig::new().set_handshake_timeout(timeout))
             .add(
                 ntex_h2::ServiceConfig::new()
                     .set_max_header_list_size(256 * 1024)
                     .set_max_header_continuation_frames(96),
-            )
-            .add(
-                WsClientConfig::new()
-                    .set_address(self.addr)
-                    .set_timeout(Seconds(30)),
-            )
-            .build();
+            );
+        #[cfg(feature = "ws")]
+        let cfg = cfg.add(
+            WsClientConfig::new()
+                .set_address(self.addr)
+                .set_timeout(Seconds(30)),
+        );
+        self.cfg = cfg.build();
         self.client = Self::create_client(self.cfg.clone());
         self
     }
