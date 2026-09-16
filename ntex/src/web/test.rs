@@ -758,7 +758,7 @@ where
     thread::sleep(Millis(25).into());
 
     let cfg = cfg.client_cfg.clone().unwrap_or_else(|| {
-        SharedCfg::new("TEST-CLIENT")
+        let cfg = SharedCfg::new("TEST-CLIENT")
             .add(IoConfig::new().set_connect_timeout(Millis(90_000)))
             .add(ntex_tls::TlsConfig::new().set_handshake_timeout(Seconds(5)))
             .add(
@@ -766,13 +766,14 @@ where
                     .set_max_header_list_size(256 * 1024)
                     .set_max_header_continuation_frames(96),
             )
-            .add(ClientConfig::new().set_lifetime(Seconds::ZERO))
-            .add(
-                WsClientConfig::new()
-                    .set_address(addr)
-                    .set_timeout(Seconds(60)),
-            )
-            .build()
+            .add(ClientConfig::new().set_lifetime(Seconds::ZERO));
+        #[cfg(feature = "ws")]
+        let cfg = cfg.add(
+            WsClientConfig::new()
+                .set_address(addr)
+                .set_timeout(Seconds(60)),
+        );
+        cfg.build()
     });
 
     let client = {
@@ -943,6 +944,7 @@ impl TestServerConfig {
 /// Test server controller
 pub struct TestServer {
     id: Uuid,
+    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
     cfg: SharedCfg,
     addr: net::SocketAddr,
     client: Client,
