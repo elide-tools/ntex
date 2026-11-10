@@ -25,7 +25,7 @@ impl Default for ExponentialBackoff {
             multiplier: 1.5,
             max_interval: Duration::from_secs(60),
             start_time: Instant::now(),
-            max_elapsed_time: Some(Duration::from_secs(900)),
+            max_elapsed_time: Some(Duration::from_mins(15)),
         }
     }
 }
@@ -59,20 +59,18 @@ impl ExponentialBackoff {
     }
 }
 
-/// Uniform value in `[min, max]` nanoseconds around `interval`.
+/// Uniform value in `[interval - delta, interval + delta + 1ns]`, `delta = factor * interval`.
 fn randomize(factor: f64, random: f64, interval: Duration) -> Duration {
-    let nanos = interval.as_nanos() as f64;
-    let delta = factor * nanos;
-    let min = nanos - delta;
-    let value = min + random * (2.0 * delta + 1.0);
-    Duration::from_nanos(value as u64)
+    let secs = interval.as_secs_f64();
+    let delta = factor * secs;
+    Duration::from_secs_f64(random.mul_add(2.0f64.mul_add(delta, 1e-9), secs - delta))
 }
 
-/// Non-cryptographic value in `[0, 1)` from std's randomly keyed SipHash.
+/// Non-cryptographic value in `[0, 1)` from std's randomly keyed `SipHash`.
 fn random() -> f64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(0);
-    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+    f64::from(u32::try_from(hasher.finish() >> 32).unwrap_or(0)) / f64::from(u32::MAX).next_up()
 }
 
 #[cfg(test)]
