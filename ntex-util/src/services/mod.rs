@@ -4,6 +4,7 @@
 //! keep-alive handling, ordered processing, retries, reconnects, per-request
 //! extensions, and timeouts.
 
+mod backoff;
 pub mod buffer;
 mod extensions;
 pub mod inflight;

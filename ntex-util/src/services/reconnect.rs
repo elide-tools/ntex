@@ -8,7 +8,7 @@ use std::{
     cell::Cell, cell::RefCell, error::Error, fmt, marker::PhantomData, rc::Rc, time::Instant,
 };
 
-use backoff::{Clock, ExponentialBackoff, backoff::Backoff};
+use super::backoff::ExponentialBackoff;
 use ntex_error::fmt_err_string;
 use ntex_service::{BindCtx, Ctx, ReadyBinding, ReadyNotifier, Service, ServiceFactory};
 
@@ -429,7 +429,7 @@ impl<P, Sf, S, St> ReconnectServiceInner<P, Sf, S, St> {
     fn start_backoff(&self) {
         if !self.backoff_active.replace(true) {
             let mut backoff = self.backoff.borrow_mut();
-            backoff.start_time = backoff.clock.now();
+            backoff.start_time = Instant::now();
         }
     }
 

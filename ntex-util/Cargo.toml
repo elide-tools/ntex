@@ -25,7 +25,6 @@ ntex-error = { workspace = true }
 ntex-service = { workspace = true }
 ntex-rt = { workspace = true }
 
-backoff = { workspace = true }
 bitflags = { workspace = true }
 foldhash = { workspace = true }
 futures-timer = { workspace = true }
